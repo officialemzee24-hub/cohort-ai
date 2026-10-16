@@ -1,102 +1,202 @@
 /**
- * LLM Chat Application Template
- *
- * A simple chat application using Cloudflare Workers AI.
- * This template demonstrates how to implement an LLM-powered chat interface with
- * streaming responses using Server-Sent Events (SSE).
- *
- * @license MIT
+ * Cohort AI Worker
+ * Keeps the template's streaming /api/chat route and adds /api/cohort-ai,
+ * a task-based JSON endpoint returning { text: string } for Cohort.
  */
-import { Env, ChatMessage } from "./types";
+import type { Env, ChatMessage } from "./types";
 
-// Model ID for Workers AI model
-// https://developers.cloudflare.com/workers-ai/models/
 const MODEL_ID = "@cf/meta/llama-3.1-8b-instruct-fp8";
-
-// Default system prompt
+const MAX_INPUT_CHARS = 18000;
 const SYSTEM_PROMPT =
-	"You are a helpful, friendly assistant. Provide concise and accurate responses.";
+  "You are Cohort Study Assistant, a helpful academic assistant for university students. " +
+  "Explain concepts clearly, use accurate information, organize answers with headings or bullets when useful, " +
+  "and never pretend to know information that was not provided. Be concise but useful.";
+
+const ALLOWED_ORIGINS = new Set(["https://officialemzee24-hub.github.io"]);
+
+function corsHeaders(origin: string | null): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Max-Age": "86400",
+    Vary: "Origin",
+  };
+  if (origin && ALLOWED_ORIGINS.has(origin)) {
+    headers["Access-Control-Allow-Origin"] = origin;
+  }
+  return headers;
+}
+
+function jsonResponse(data: unknown, status: number, cors: Record<string, string>): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...cors,
+    },
+  });
+}
 
 export default {
-	/**
-	 * Main request handler for the Worker
-	 */
-	async fetch(
-		request: Request,
-		env: Env,
-		ctx: ExecutionContext,
-	): Promise<Response> {
-		const url = new URL(request.url);
+  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+    const cors = corsHeaders(request.headers.get("Origin"));
 
-		// Handle static assets (frontend)
-		if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
-			return env.ASSETS.fetch(request);
-		}
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: cors });
+    }
 
-		// API Routes
-		if (url.pathname === "/api/chat") {
-			// Handle POST requests for chat
-			if (request.method === "POST") {
-				return handleChatRequest(request, env);
-			}
+    // Preserve the template frontend and static assets.
+    if (url.pathname === "/" || !url.pathname.startsWith("/api/")) {
+      return env.ASSETS.fetch(request);
+    }
 
-			// Method not allowed for other request types
-			return new Response("Method not allowed", { status: 405 });
-		}
+    if (url.pathname === "/api/chat") {
+      if (request.method !== "POST") {
+        return new Response("Method not allowed", {
+          status: 405,
+          headers: { ...cors, Allow: "POST, OPTIONS" },
+        });
+      }
+      return handleChatRequest(request, env, cors);
+    }
 
-		// Handle 404 for unmatched routes
-		return new Response("Not found", { status: 404 });
-	},
+    if (url.pathname === "/api/cohort-ai" || url.pathname === "/api/assistant") {
+      if (request.method !== "POST") {
+        return jsonResponse({ error: "Method not allowed" }, 405, cors);
+      }
+      return handleCohortRequest(request, env, cors);
+    }
+
+    return jsonResponse({ error: "Not found" }, 404, cors);
+  },
 } satisfies ExportedHandler<Env>;
 
-/**
- * Handles chat API requests
- */
 async function handleChatRequest(
-	request: Request,
-	env: Env,
+  request: Request,
+  env: Env,
+  cors: Record<string, string>,
 ): Promise<Response> {
-	try {
-		// Parse JSON request body
-		const { messages = [] } = (await request.json()) as {
-			messages: ChatMessage[];
-		};
+  try {
+    const body = (await request.json()) as { messages?: ChatMessage[] };
+    const messages = Array.isArray(body.messages) ? [...body.messages] : [];
+    if (messages.length === 0) {
+      return jsonResponse({ error: "Please provide a non-empty messages array." }, 400, cors);
+    }
+    if (!messages.some((message) => message.role === "system")) {
+      messages.unshift({ role: "system", content: SYSTEM_PROMPT });
+    }
+    const inputs = {
+      messages,
+      max_tokens: 1024,
+      stream: true,
+    } satisfies AiTextGenerationInput & { stream: true };
+    const stream = await env.AI.run<typeof MODEL_ID>(MODEL_ID, inputs);
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        ...cors,
+      },
+    });
+  } catch (error) {
+    console.error("Error processing /api/chat:", error);
+    return jsonResponse({ error: "Failed to process chat request." }, 500, cors);
+  }
+}
 
-		// Add system prompt if not present
-		if (!messages.some((msg) => msg.role === "system")) {
-			messages.unshift({ role: "system", content: SYSTEM_PROMPT });
-		}
+function taskInstructions(task: string): string {
+  switch (task.toLowerCase()) {
+    case "explain":
+      return "Explain the topic step by step in student-friendly language. Define important terms and give an example where useful.";
+    case "summary":
+    case "summarize":
+      return "Summarize the supplied material. Preserve its main points and terminology. Use headings and bullet points where helpful. Do not invent details absent from the material.";
+    case "quiz":
+      return "Create a practice quiz from the supplied topic or notes. Number the questions and include an answer key at the end. Follow the requested question count if provided.";
+    case "catchup":
+    case "catch-up":
+      return "Help the student catch up on the supplied discussion or notes. Summarize what happened, identify key decisions or concepts, and list useful next steps. Do not invent missing details.";
+    case "reminders":
+    case "reminder":
+      return "Extract dates, deadlines, tasks, and reminders explicitly stated in the supplied text. If none are present, say so. Do not invent dates.";
+    case "moderate":
+    case "moderation":
+      return "Review the supplied message for clear harassment, threats, spam, or abusive content. Give a brief, neutral assessment and cite the textual reason. Do not infer intent without evidence.";
+    case "ask":
+    case "question":
+    default:
+      return "Answer the student's question clearly and accurately. If there is not enough information, say what is missing.";
+  }
+}
 
-		const inputs = {
-			messages,
-			max_tokens: 1024,
-			stream: true,
-		} satisfies AiTextGenerationInput & { stream: true };
+async function handleCohortRequest(
+  request: Request,
+  env: Env,
+  cors: Record<string, string>,
+): Promise<Response> {
+  try {
+    const body = (await request.json()) as {
+      task?: string;
+      type?: string;
+      action?: string;
+      text?: string;
+      content?: string;
+      prompt?: string;
+      question?: string;
+      context?: string;
+      count?: number;
+      messages?: ChatMessage[];
+    };
 
-		const stream = await env.AI.run<typeof MODEL_ID>(MODEL_ID, inputs, {
-			// Uncomment to use AI Gateway
-			// gateway: {
-			//   id: "YOUR_GATEWAY_ID", // Replace with your AI Gateway ID
-			//   skipCache: false,      // Set to true to bypass cache
-			//   cacheTtl: 3600,        // Cache time-to-live in seconds
-			// },
-		});
+    const task = String(body.task || body.type || body.action || "ask").slice(0, 40);
+    let userContent = [body.text, body.content, body.context, body.question, body.prompt]
+      .filter((part): part is string => typeof part === "string" && part.trim().length > 0)
+      .join("\n\n")
+      .slice(0, MAX_INPUT_CHARS);
 
-		return new Response(stream, {
-			headers: {
-				"content-type": "text/event-stream; charset=utf-8",
-				"cache-control": "no-cache",
-				connection: "keep-alive",
-			},
-		});
-	} catch (error) {
-		console.error("Error processing chat request:", error);
-		return new Response(
-			JSON.stringify({ error: "Failed to process request" }),
-			{
-				status: 500,
-				headers: { "content-type": "application/json" },
-			},
-		);
-	}
+    if (Array.isArray(body.messages) && body.messages.length > 0) {
+      const lastUserMessage = [...body.messages].reverse().find((message) => message.role === "user");
+      if (!userContent && lastUserMessage && typeof lastUserMessage.content === "string") {
+        userContent = lastUserMessage.content.slice(0, MAX_INPUT_CHARS);
+      }
+    }
+    if (!userContent.trim()) {
+      return jsonResponse(
+        { error: "Missing text, question, prompt, content, context, or user message." },
+        400,
+        cors,
+      );
+    }
+
+    const countInstruction =
+      task.toLowerCase() === "quiz" && Number.isFinite(body.count) && Number(body.count) > 0
+        ? ` Make exactly ${Math.min(20, Math.floor(Number(body.count)))} quiz questions.`
+        : "";
+
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content: `${SYSTEM_PROMPT}\nTask: ${taskInstructions(task)}${countInstruction}`,
+      },
+      { role: "user", content: userContent },
+    ];
+
+    const result = await env.AI.run<typeof MODEL_ID>(MODEL_ID, {
+      messages,
+      max_tokens: 1200,
+      temperature: 0.4,
+    });
+    const output = typeof result === "string" ? result : (result as { response?: string }).response;
+    if (!output || typeof output !== "string") {
+      console.error("Unexpected Workers AI response shape.");
+      return jsonResponse({ error: "The AI returned an empty response. Please try again." }, 502, cors);
+    }
+    return jsonResponse({ text: output }, 200, cors);
+  } catch (error) {
+    console.error("Error processing Cohort AI request:", error);
+    return jsonResponse({ error: "Failed to process the Cohort AI request." }, 500, cors);
+  }
 }
