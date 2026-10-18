@@ -1,7 +1,7 @@
 /**
  * Cohort AI Worker
  * Keeps the template's streaming /api/chat route and adds /api/cohort-ai,
- * a task-based JSON endpoint returning { text: string } for Cohort.
+ * a task-based endpoint supporting both streaming responses and JSON { text }.
  */
 import type { Env, ChatMessage } from "./types";
 
@@ -149,6 +149,7 @@ async function handleCohortRequest(
       context?: string;
       count?: number;
       messages?: ChatMessage[] | string;
+      stream?: boolean;
     };
 
     const task = String(body.task || body.type || body.action || "ask").slice(0, 40);
@@ -193,6 +194,25 @@ async function handleCohortRequest(
       },
       { role: "user", content: historyContext ? `Previous conversation (use this to understand follow-ups):\n${historyContext}\n\nCurrent request:\n${userContent}` : userContent },
     ];
+
+    if (body.stream === true) {
+      const stream = await env.AI.run<typeof MODEL_ID>(MODEL_ID, {
+        messages,
+        max_tokens: 800,
+        temperature: 0.4,
+        stream: true,
+      } satisfies AiTextGenerationInput & { stream: true });
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+          ...cors,
+        },
+      });
+    }
 
     const result = await env.AI.run<typeof MODEL_ID>(MODEL_ID, {
       messages,
