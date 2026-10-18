@@ -148,7 +148,7 @@ async function handleCohortRequest(
       question?: string;
       context?: string;
       count?: number;
-      messages?: ChatMessage[];
+      messages?: ChatMessage[] | string;
     };
 
     const task = String(body.task || body.type || body.action || "ask").slice(0, 40);
@@ -157,11 +157,21 @@ async function handleCohortRequest(
       .join("\n\n")
       .slice(0, MAX_INPUT_CHARS);
 
-    if (Array.isArray(body.messages) && body.messages.length > 0) {
-      const lastUserMessage = [...body.messages].reverse().find((message) => message.role === "user");
-      if (!userContent && lastUserMessage && typeof lastUserMessage.content === "string") {
-        userContent = lastUserMessage.content.slice(0, MAX_INPUT_CHARS);
-      }
+    // Cohort's current chatbox sends history as a formatted string. Other clients
+    // may send a structured ChatMessage array, so support both formats.
+    let historyContext = "";
+    if (typeof body.messages === "string") {
+      historyContext = body.messages.trim().slice(-10000);
+    } else if (Array.isArray(body.messages) && body.messages.length > 0) {
+      const validHistory = body.messages
+        .filter((message) => message && ["user", "assistant"].includes(message.role) && typeof message.content === "string")
+        .slice(-10);
+      historyContext = validHistory
+        .map((message) => `${message.role === "user" ? "Student" : "Cohort AI"}: ${message.content}`)
+        .join("\n")
+        .slice(-10000);
+      const lastUserMessage = [...validHistory].reverse().find((message) => message.role === "user");
+      if (!userContent && lastUserMessage) userContent = lastUserMessage.content.slice(0, MAX_INPUT_CHARS);
     }
     if (!userContent.trim()) {
       return jsonResponse(
@@ -181,12 +191,12 @@ async function handleCohortRequest(
         role: "system",
         content: `${SYSTEM_PROMPT}\nTask: ${taskInstructions(task)}${countInstruction}`,
       },
-      { role: "user", content: userContent },
+      { role: "user", content: historyContext ? `Previous conversation (use this to understand follow-ups):\n${historyContext}\n\nCurrent request:\n${userContent}` : userContent },
     ];
 
     const result = await env.AI.run<typeof MODEL_ID>(MODEL_ID, {
       messages,
-      max_tokens: 1200,
+      max_tokens: 800,
       temperature: 0.4,
     });
     const output = typeof result === "string" ? result : (result as { response?: string }).response;
